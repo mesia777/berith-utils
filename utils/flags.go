@@ -13,7 +13,7 @@ var (
 		Usage: "path of config file.",
 	}
 	NodeNameFlag = cli.StringFlag{
-		Name:  "name, n",
+		Name:  "name",
 		Usage: "name of a node",
 	}
 	HostUserFlag = cli.StringFlag{

@@ -6,9 +6,13 @@ import (
 	"fmt"
 	"github.com/mesia777/berith-utils/node"
 	"github.com/mesia777/berith-utils/types"
+	"github.com/mesia777/berith-utils/utils"
+	"github.com/pkg/sftp"
 	"github.com/urfave/cli"
 	"golang.org/x/crypto/ssh"
 	"io/ioutil"
+	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 )
@@ -52,6 +56,18 @@ var (
 				Action:    stopNodes,
 				ArgsUsage: "[node name or empty if all]",
 			},
+			{
+				Name:      "upload",
+				Usage:     "upload files in workspace/berith dir to node",
+				Action:    uploadFiles,
+				ArgsUsage: "[node name or empty if all]",
+			},
+			{
+				Name:      "command",
+				Usage:     "execute a command",
+				Action:    executeCommand,
+				ArgsUsage: "[node name or empty if all]",
+			},
 		},
 	}
 )
@@ -83,7 +99,7 @@ func buildNodes(ctx *cli.Context) error {
 	}
 
 	if len(nodes) == 0 {
-		return errors.New("empty nodes to init")
+		return errors.New("empty nodes to build")
 	}
 
 	executesCommand(nodes, func(n *types.Node) string {
@@ -100,7 +116,7 @@ func startNodes(ctx *cli.Context) error {
 	}
 
 	if len(nodes) == 0 {
-		return errors.New("empty nodes to init")
+		return errors.New("empty nodes to start")
 	}
 
 	executesCommand(nodes, func(n *types.Node) string {
@@ -117,7 +133,7 @@ func stopNodes(ctx *cli.Context) error {
 	}
 
 	if len(nodes) == 0 {
-		return errors.New("empty nodes to init")
+		return errors.New("empty nodes to stop")
 	}
 
 	executesCommand(nodes, func(n *types.Node) string {
@@ -126,9 +142,150 @@ func stopNodes(ctx *cli.Context) error {
 	return nil
 }
 
+// uploadConfigs upload files from {workspace}/berith to "~/berith-test/"
+func uploadFiles(ctx *cli.Context) error {
+	nodes, err := extractNodes(ctx)
+	if err != nil {
+		return err
+	}
+
+	if len(nodes) == 0 {
+		return errors.New("empty nodes to upload files")
+	}
+
+	var success, fail []string
+	upload := func(n *types.Node) (bool, string) {
+		// setup sftp
+		var out bytes.Buffer
+		out.WriteString("------------------------------------------------\n")
+		out.WriteString(fmt.Sprintf("try to upload files. node : %s\n", n.Name))
+
+		c, err := createSSHClient(n)
+		if err != nil {
+			out.WriteString(fmt.Sprintf("failed to create a ssh client. node %s", n.Name))
+			return false, out.String()
+		}
+		defer c.Close()
+
+		client, err := sftp.NewClient(c)
+		if err != nil {
+			out.WriteString(fmt.Sprintf("failed to create a sftp client. node %s, %v", n.Name, err))
+		}
+		defer client.Close()
+
+		workspace, err := utils.GetWorkspace()
+		berithDir := filepath.Join(workspace, "berith")
+		dir, err := ioutil.ReadDir(berithDir)
+		if err != nil {
+			out.WriteString(fmt.Sprintf("failed to read dir. node %s, %v", n.Name, err))
+		}
+		out.WriteString(fmt.Sprintf("Upload files(#%d) in %s\n", len(dir), berithDir))
+
+		var uploadWait sync.WaitGroup
+		uploadWait.Add(len(dir))
+
+		// upload files
+		for _, info := range dir {
+			file, err := os.Open(filepath.Join(berithDir, info.Name()))
+			if err != nil {
+				out.WriteString(fmt.Sprintf("failed to open a file: %s", file.Name()))
+				uploadWait.Done()
+				continue
+			}
+
+			go func(file *os.File, info os.FileInfo) {
+				defer uploadWait.Done()
+				f, err := client.Create("berith-test/" + info.Name())
+				if err != nil {
+					fmt.Println("Failed to create a file:", info.Name())
+					out.WriteString(fmt.Sprintf("failed to upload a file: %s,%v", file.Name(), err))
+					return
+				}
+				defer f.Close()
+				read, err := ioutil.ReadAll(file)
+				if err != nil {
+					fmt.Println("Failed to create a file:", info.Name())
+					out.WriteString(fmt.Sprintf("failed to read a file: %s after create,%v", file.Name(), err))
+					return
+				}
+
+				if _, err := f.Write(read); err != nil {
+					fmt.Println("Failed to create a file:", info.Name())
+					out.WriteString(fmt.Sprintf("failed to write content a file: %s,%v", file.Name(), err))
+					return
+				}
+				err = client.Chmod(f.Name(), info.Mode())
+				if err != nil {
+					out.WriteString(fmt.Sprintf("failed to change permission%v", err))
+				}
+			}(file, info)
+		}
+		uploadWait.Wait()
+		return true, out.String()
+	}
+
+	var waitGroup sync.WaitGroup
+	waitGroup.Add(len(nodes))
+	for _, n := range nodes {
+		go func(n *types.Node) {
+			defer waitGroup.Done()
+			result, out := upload(n)
+			if result {
+				success = append(success, n.Name)
+			} else {
+				fail = append(fail, n.Name)
+			}
+			fmt.Println(out)
+		}(n)
+	}
+	waitGroup.Wait()
+	fmt.Printf("## Complete to upload. success nodes : %v / failures : %v\n", success, fail)
+	return nil
+}
+
+func executeCommand(ctx *cli.Context) error {
+	var nodeName, command string
+	switch ctx.NArg() {
+	case 1:
+		command = ctx.Args()[0]
+	case 2:
+		nodeName = ctx.Args()[0]
+		command = ctx.Args()[1]
+	default:
+		return errors.New("invalid args")
+	}
+
+	var nodes []*types.Node
+	var err error
+
+	if nodeName == "" {
+		nodes, err = node.GetNodes(app.db)
+		if err != nil {
+			return err
+		}
+	} else {
+		n, err := node.GetNode(app.db, ctx.Args()[0])
+		if err != nil {
+			return err
+		}
+		nodes = append(nodes, n)
+	}
+	if len(nodes) == 0 {
+		return errors.New("empty nodes to execute command")
+	}
+
+	executesCommand(nodes, func(n *types.Node) string {
+		return command
+	})
+	return nil
+}
+
 func executesCommand(nodes []*types.Node, cmdGen commandGenerator) {
 	var waitGroup sync.WaitGroup
 	waitGroup.Add(len(nodes))
+
+	var success []string
+	var fail []string
 
 	for _, n := range nodes {
 		go func(n *types.Node) {
@@ -144,6 +301,7 @@ func executesCommand(nodes []*types.Node, cmdGen commandGenerator) {
 			conn, err := createSSHClient(n)
 			if err != nil {
 				b.WriteString("failed to execute. reason : cannot create a ssh client\n")
+				fail = append(fail, n.Name)
 				return
 			}
 			defer conn.Close()
@@ -151,24 +309,30 @@ func executesCommand(nodes []*types.Node, cmdGen commandGenerator) {
 			session, err := conn.NewSession()
 			if err != nil {
 				b.WriteString("failed to execute. reason : cannot create a session\n")
+				fail = append(fail, n.Name)
 				return
 			}
 			defer session.Close()
 
 			var stdOut bytes.Buffer
+			var stdErr bytes.Buffer
 			session.Stdout = &stdOut
+			session.Stderr = &stdErr
 			err = session.Run(cmd)
 			if err != nil {
 				b.WriteString(fmt.Sprintf("failed to execute a node %s. reason: %v\n", n.Name, err))
+				b.Write(stdErr.Bytes())
+				fail = append(fail, n.Name)
 				return
 			}
 			b.WriteString("success to execute. node: " + n.Name + "\n")
 			b.Write(stdOut.Bytes())
 			b.WriteByte('\n')
+			success = append(success, n.Name)
 		}(n)
 	}
-
 	waitGroup.Wait()
+	fmt.Printf("## Complete to execute nodes. success %v, fail : %v\n", success, fail)
 }
 
 // extractNodes extract nodes given cli context

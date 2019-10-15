@@ -74,16 +74,36 @@ func GetNodes(db *db.Database) ([]*types.Node, error) {
 }
 
 // UpdateNode update a given node into data store
-func UpdateNode(db *db.Database, node *types.Node) error {
-	has, err := db.Has(getNodeKey(node.Name))
+func UpdateNode(db *db.Database, update *types.Node) error {
+	f, err := GetNode(db, update.Name)
 	if err != nil {
 		return err
 	}
-	if !has {
-		return errors.New("not exist host with name " + node.Name)
+
+	// FIXME : more efficient compare
+	if f.Name != update.Name {
+		f.Name = update.Name
+	}
+	if f.Host.Address != update.Host.Address {
+		f.Host.Address = update.Host.Address
+	}
+	if f.Host.Password != update.Host.Password {
+		f.Host.Password = update.Host.Password
+	}
+	if f.Host.Port != update.Host.Port {
+		f.Host.Port = update.Host.Port
+	}
+	if f.Host.User != update.Host.User {
+		f.Host.User = update.Host.User
+	}
+	if f.Host.KeyPath != update.Host.KeyPath {
+		f.Host.KeyPath = update.Host.KeyPath
+	}
+	if f.Host.Description != update.Host.Description {
+		f.Host.Description = update.Host.Description
 	}
 
-	err = AddNode(db, node)
+	err = AddNode(db, f)
 	if err == nil {
 		log.Println("success to update")
 	}
